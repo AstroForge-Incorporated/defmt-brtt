@@ -5,15 +5,6 @@ use core::{
 
 use crate::consts::BUF_SIZE;
 
-/// Optional execution-trace RTT ring size (2 KiB). Kept record-compatible: the
-/// whole-record writer reserves one byte, so a 2 KiB ring holds exactly 63
-/// complete 32-byte records before the next write is refused without mutation.
-#[cfg(feature = "execution-trace")]
-pub const TRACE_BUF_SIZE: usize = 2 * 1024;
-
-#[cfg(feature = "execution-trace")]
-const _: () = assert!(TRACE_BUF_SIZE % 32 == 0 && TRACE_BUF_SIZE >= 64);
-
 #[repr(C)]
 pub struct Header {
     id: [u8; 16],
@@ -89,26 +80,24 @@ static NAME: [u8; 6] = *b"defmt\0";
 static mut TRACE_NAME: [u8; 6] = *b"trace\0";
 
 #[cfg(feature = "execution-trace")]
-#[cfg_attr(target_arch = "arm", link_section = ".execution_trace.trace_buffer")]
-static mut TRACE_BUFFER: [u8; TRACE_BUF_SIZE] = [0; TRACE_BUF_SIZE];
-
-#[cfg(feature = "execution-trace")]
 static TRACE_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Initialize the cache-incoherent RTT objects in their linker-reserved,
-/// non-cacheable region. Called once by the shared HAL before defmt is started.
+/// non-cacheable region, with `trace_buffer` as up-channel 1. Called once before
+/// defmt is started.
+///
+/// # Safety
+/// `trace_buffer` must be valid for writes of `trace_size` bytes for the life
+/// of the program and must not be accessed by anything except the trace writer
+/// and the debug host.
 #[cfg(feature = "execution-trace")]
-pub fn init_trace_channels() {
+pub unsafe fn init_trace_channels(trace_buffer: *mut u8, trace_size: usize) {
     if TRACE_READY.load(Ordering::Acquire) {
         return;
     }
     unsafe {
         ptr::write_bytes(ptr::addr_of_mut!(BUFFER).cast::<u8>(), 0, BUF_SIZE);
-        ptr::write_bytes(
-            ptr::addr_of_mut!(TRACE_BUFFER).cast::<u8>(),
-            0,
-            TRACE_BUF_SIZE,
-        );
+        ptr::write_bytes(trace_buffer, 0, trace_size);
         ptr::copy_nonoverlapping(b"defmt\0".as_ptr(), ptr::addr_of_mut!(NAME).cast::<u8>(), 6);
         ptr::copy_nonoverlapping(
             b"trace\0".as_ptr(),
@@ -130,8 +119,8 @@ pub fn init_trace_channels() {
                 },
                 Channel {
                     name: ptr::addr_of!(TRACE_NAME).cast::<u8>(),
-                    buffer: ptr::addr_of_mut!(TRACE_BUFFER).cast::<u8>(),
-                    size: TRACE_BUF_SIZE,
+                    buffer: trace_buffer,
+                    size: trace_size,
                     write: AtomicUsize::new(0),
                     read: AtomicUsize::new(0),
                     flags: AtomicUsize::new(MODE_NON_BLOCKING_TRIM),
@@ -144,7 +133,7 @@ pub fn init_trace_channels() {
 }
 
 // Safety: the defmt logger serializes channel 0 with its existing critical
-// section. The trace writer is only called by the single drain task.
+// section. Callers of `try_write_trace` serialize channel 1 themselves.
 pub(crate) unsafe fn handle() -> &'static Channel {
     #[cfg(feature = "execution-trace")]
     {
@@ -160,17 +149,17 @@ pub(crate) fn do_write(bytes: &[u8]) {
     unsafe { handle().write_all(bytes) }
 }
 
-/// Publish one complete 32-byte trace record, or return false without moving
-/// the write index. This is deliberately nonblocking and must not be called by
-/// executor hooks; the drain task retries it later.
+/// Publish `bytes` to up-channel 1 in full, or return false without moving the
+/// write index. Never blocks. Callers must serialize writes (e.g. under a
+/// critical section).
 #[cfg(feature = "execution-trace")]
-pub fn try_write_trace_record(record: &[u8; 32]) -> bool {
+pub fn try_write_trace(bytes: &[u8]) -> bool {
     if !TRACE_READY.load(Ordering::Acquire) {
         return false;
     }
     let channel = unsafe { &(*ptr::addr_of!(_SEGGER_RTT).cast::<Header>()).up_channels[1] };
     let read = channel.read.load(Ordering::Acquire);
-    unsafe { try_write_full_record(channel.buffer, TRACE_BUF_SIZE, read, &channel.write, record) }
+    unsafe { try_write_full_record(channel.buffer, channel.size, read, &channel.write, bytes) }
 }
 
 #[cfg(feature = "execution-trace")]
@@ -188,7 +177,7 @@ pub unsafe fn try_write_full_record(
     capacity: usize,
     read: usize,
     write_index: &AtomicUsize,
-    record: &[u8; 32],
+    record: &[u8],
 ) -> bool {
     let write = write_index.load(Ordering::Relaxed);
     if trace_available(read, write, capacity) < record.len() {
@@ -288,6 +277,8 @@ fn available_buffer_size(read_cursor: usize, write_cursor: usize, capacity: usiz
 mod tests {
     use super::*;
 
+    const TRACE_BUF_SIZE: usize = 2 * 1024;
+
     #[test]
     fn trace_record_retries_atomically_then_wraps() {
         let mut ring = [0xAA; 64];
@@ -301,6 +292,18 @@ mod tests {
         assert_eq!(write.load(Ordering::Acquire), 8);
         assert!(ring[40..].iter().all(|byte| *byte == 0x5A));
         assert!(ring[..8].iter().all(|byte| *byte == 0x5A));
+    }
+
+    #[test]
+    fn multi_record_block_is_all_or_nothing() {
+        let mut ring = [0u8; 128];
+        let write = AtomicUsize::new(64);
+        // 63 bytes free: a 64-byte block is refused, a 48-byte one fits.
+        assert!(!unsafe { try_write_full_record(ring.as_mut_ptr(), 128, 0, &write, &[0x11; 64]) });
+        assert_eq!(write.load(Ordering::Relaxed), 64);
+        assert!(ring.iter().all(|byte| *byte == 0));
+        assert!(unsafe { try_write_full_record(ring.as_mut_ptr(), 128, 0, &write, &[0x22; 48]) });
+        assert_eq!(write.load(Ordering::Relaxed), 112);
     }
 
     #[test]
