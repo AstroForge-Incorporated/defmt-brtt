@@ -37,3 +37,4 @@ default = [
 bbq = [ "dep:bbqueue" ]
 async-await = [ ]
 rtt = [ ]
+execution-trace = ["rtt"]

@@ -10,8 +10,10 @@ pub use bbq::internal_initialize;
 #[cfg(feature = "bbq")]
 pub use bbq::{DefmtConsumer, Error as BBQError, GrantR, SplitGrantR};
 
-#[cfg(feature = "rtt")]
+#[cfg(all(feature = "rtt", not(feature = "execution-trace")))]
 mod rtt;
+#[cfg(feature = "execution-trace")]
+pub mod rtt;
 #[cfg(feature = "rtt")]
 use rtt::handle;
 
